@@ -120,20 +120,21 @@ def webhook_etapa_pedido_check():
 @app.post("/webhook/etapa-pedido")
 async def webhook_etapa_pedido(request: Request):
     """
-    Formato real confirmado via teste (Pipedream), tópico
-    'VendaProduto.EtapaAlterada':
+    Formato real confirmado pelo webhook do Omie em produção:
 
     {
-      "topico": "VendaProduto.EtapaAlterada",
-      "evento": {
-        "numeroPedido": "34589",
-        "etapa": "60",
-        "etapaDescr": "Faturado",
-        "faturada": "S",
-        "idPedido": 9191271793,
-        "codIntPedido": "27803",
+      "messageId": "...",
+      "topic": "VendaProduto.EtapaAlterada",
+      "event": {
+        "numeroPedido": "34552",
+        "etapa": "50",
+        "etapaDescr": "Faturar",
+        "idPedido": 9190977970,
+        "codIntPedido": "27772",
         ...
       },
+      "author": {...},
+      "appKey": "...",
       ...
     }
     """
@@ -142,12 +143,12 @@ async def webhook_etapa_pedido(request: Request):
     print(payload)
     print("=============================")
 
-    topico = payload.get("topico")
+    topico = payload.get("topic")
     if topico != "VendaProduto.EtapaAlterada":
         print(f"↪️ Tópico '{topico}' não é de interesse. Ignorando.")
         return {"status": "ignorado", "motivo": "topico não monitorado"}
 
-    evento = payload.get("evento", {})
+    evento = payload.get("event", {})
     numero_pedido = evento.get("numeroPedido")
     etapa = evento.get("etapa")
 
