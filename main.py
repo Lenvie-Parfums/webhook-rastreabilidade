@@ -111,6 +111,12 @@ def processar_pedido(numero_pedido):
     _pedidos_processados.add(numero_pedido)
 
 
+@app.get("/webhook/etapa-pedido")
+def webhook_etapa_pedido_check():
+    """Responde ao teste de validação que o Omie faz ao salvar o webhook."""
+    return {"status": "ok"}
+
+
 @app.post("/webhook/etapa-pedido")
 async def webhook_etapa_pedido(request: Request):
     """
