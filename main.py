@@ -73,10 +73,14 @@ def processar_pedido(numero_pedido):
     det_atualizado = []
     algum_lote_encontrado = False
 
-    for item in itens:
+    for idx, item in enumerate(itens, start=1):
         produto = item.get("produto", {})
         codigo_produto = produto.get("codigo_produto")
-        codigo_item_integracao = item.get("ide", {}).get("codigo_item_integracao")
+
+        # Código de integração do item: usa o que já existe no pedido, ou,
+        # se não houver (pedido criado manualmente), usa o número sequencial
+        # do item (1, 2, 3...) -- conforme orientação da doc Omie.
+        codigo_item_integracao = item.get("ide", {}).get("codigo_item_integracao") or str(idx)
 
         _descricao, sku = consultar_produto(codigo_produto)
 
