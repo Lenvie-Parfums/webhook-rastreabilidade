@@ -114,30 +114,44 @@ def processar_pedido(numero_pedido):
 @app.post("/webhook/etapa-pedido")
 async def webhook_etapa_pedido(request: Request):
     """
-    IMPORTANTE: o formato exato do payload do Omie precisa ser confirmado
-    testando com um RequestBin (veja a doc oficial:
-    https://ajuda.omie.com.br/pt-BR/articles/5412754-utilizando-os-webhooks-no-omie).
+    Formato real confirmado via teste (Pipedream), tópico
+    'VendaProduto.EtapaAlterada':
 
-    Os nomes de campo abaixo (numero_pedido / nNumPedido / etc.) são um
-    palpite baseado no padrão dos outros webhooks do Omie -- ajuste depois
-    de ver o payload real chegando no RequestBin.
+    {
+      "topico": "VendaProduto.EtapaAlterada",
+      "evento": {
+        "numeroPedido": "34589",
+        "etapa": "60",
+        "etapaDescr": "Faturado",
+        "faturada": "S",
+        "idPedido": 9191271793,
+        "codIntPedido": "27803",
+        ...
+      },
+      ...
+    }
     """
     payload = await request.json()
     print("===== WEBHOOK RECEBIDO =====")
     print(payload)
     print("=============================")
 
-    # tenta extrair o número do pedido de algumas variações comuns
-    evento = payload.get("event", payload)
-    numero_pedido = (
-        evento.get("numero_pedido")
-        or evento.get("nNumPedido")
-        or evento.get("codigo_pedido")
-    )
+    topico = payload.get("topico")
+    if topico != "VendaProduto.EtapaAlterada":
+        print(f"↪️ Tópico '{topico}' não é de interesse. Ignorando.")
+        return {"status": "ignorado", "motivo": "topico não monitorado"}
+
+    evento = payload.get("evento", {})
+    numero_pedido = evento.get("numeroPedido")
+    etapa = evento.get("etapa")
 
     if not numero_pedido:
-        print("❌ Não foi possível identificar o número do pedido no payload.")
-        return {"status": "ignorado", "motivo": "numero_pedido não encontrado"}
+        print("❌ Não foi possível identificar o numeroPedido no payload.")
+        return {"status": "ignorado", "motivo": "numeroPedido não encontrado"}
+
+    if etapa != ETAPA_FATURAR:
+        print(f"↪️ Pedido {numero_pedido} mudou pra etapa {etapa} ({evento.get('etapaDescr')}), não é a etapa de faturar ({ETAPA_FATURAR}). Ignorando.")
+        return {"status": "ignorado", "motivo": f"etapa {etapa} não monitorada"}
 
     try:
         processar_pedido(numero_pedido)
