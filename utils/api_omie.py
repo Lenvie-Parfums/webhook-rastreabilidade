@@ -17,10 +17,15 @@ _cache_produto = {}
 
 
 def _chamada_omie(url, payload, tentativas=4):
-    """Wrapper genérico com retry em rate limit, igual ao padrão que você já usa."""
+    """Wrapper genérico com retry em rate limit e timeout, igual ao padrão que você já usa."""
     for tentativa in range(1, tentativas + 1):
-        response = requests.post(url, json=payload, timeout=30)
-        resultado = response.json()
+        try:
+            response = requests.post(url, json=payload, timeout=60)
+            resultado = response.json()
+        except requests.exceptions.Timeout:
+            print(f"⏱️ Timeout na tentativa {tentativa}/{tentativas}. Aguardando 10s antes de tentar novamente...")
+            time.sleep(10)
+            continue
 
         fault = resultado.get("faultstring", "")
         if fault.startswith("ERROR: Consumo redundante") or "MISUSE" in fault or "REDUNDANT" in fault:
