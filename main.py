@@ -19,7 +19,7 @@ from utils.neon_select import buscar_lote_validade
 
 app = FastAPI()
 
-ETAPA_FATURAR = "50"
+ETAPA_SEPARACAO = "20"
 
 # guarda em memória os pedidos já processados nesta execução,
 # pra não duplicar trabalho se o Omie reenviar o mesmo webhook
@@ -94,14 +94,20 @@ def processar_pedido(numero_pedido):
 
         fabricacao_str, validade_str = _calcular_fabricacao_validade(validade_raw)
 
+        rastreabilidade = {
+            "numeroLote": lote,
+            "qtdeProdutoLote": produto.get("quantidade"),
+        }
+        # só inclui as datas se ambas forem válidas — campos vazios geram
+        # 'dVal: - -' no XML da NF-e e causam rejeição da SEFAZ (erro 1839)
+        if fabricacao_str:
+            rastreabilidade["dataFabricacaoLote"] = fabricacao_str
+        if validade_str:
+            rastreabilidade["dataValidadeLote"] = validade_str
+
         det_atualizado.append({
             "ide": {"codigo_item_integracao": codigo_item_integracao},
-            "rastreabilidade": {
-                "numeroLote": lote,
-                "dataFabricacaoLote": fabricacao_str,
-                "dataValidadeLote": validade_str,
-                "qtdeProdutoLote": produto.get("quantidade"),
-            },
+            "rastreabilidade": rastreabilidade,
         })
         algum_lote_encontrado = True
 
@@ -160,8 +166,8 @@ async def webhook_etapa_pedido(request: Request):
         print("❌ Não foi possível identificar o numeroPedido no payload.")
         return {"status": "ignorado", "motivo": "numeroPedido não encontrado"}
 
-    if etapa != ETAPA_FATURAR:
-        print(f"↪️ Pedido {numero_pedido} mudou pra etapa {etapa} ({evento.get('etapaDescr')}), não é a etapa de faturar ({ETAPA_FATURAR}). Ignorando.")
+    if etapa != ETAPA_SEPARACAO:
+        print(f"↪️ Pedido {numero_pedido} mudou pra etapa {etapa} ({evento.get('etapaDescr')}), não é separação ({ETAPA_SEPARACAO}). Ignorando.")
         return {"status": "ignorado", "motivo": f"etapa {etapa} não monitorada"}
 
     try:

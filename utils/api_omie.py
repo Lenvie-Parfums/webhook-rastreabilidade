@@ -74,7 +74,7 @@ def consultar_produto(codigo_produto) -> Tuple[Optional[str], Optional[str]]:
 
 
 def alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado) -> dict:
-    """Grava lote/validade nos itens do pedido via AlterarPedidoVenda."""
+    """Grava lote/validade nos itens e campos de frete via AlterarPedidoVenda."""
     payload = {
         "call": "AlterarPedidoVenda",
         "app_key": APP_KEY,
@@ -82,6 +82,10 @@ def alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado) -> dict:
         "param": [{
             "cabecalho": {"codigo_pedido": codigo_pedido},
             "det": det_atualizado,
+            "frete": {
+                "especie": "CAIXAS",
+                "marca": "LENVIE",
+            },
         }],
     }
 
