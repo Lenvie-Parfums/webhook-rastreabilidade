@@ -2,9 +2,9 @@
 Webhook de Rastreabilidade Automática
 ======================================
 Recebe a notificação do Omie quando um Pedido de Venda muda de etapa.
-Quando a etapa nova é "50" (Faturar), busca lote/validade no Neon
-(tblotematriz) e grava automaticamente no pedido via AlterarPedidoVenda,
-ANTES de alguém clicar em faturar.
+Quando a etapa nova é "20" (Separação), busca lote/validade no Neon
+(tblotematriz), grava automaticamente no pedido via AlterarPedidoVenda
+e preenche especie_volumes/marca_volumes no frete.
 
 Deploy: Render (mesmo padrão do projeto FRI Matriz -> ATIVA).
 """
@@ -65,8 +65,8 @@ def processar_pedido(numero_pedido):
     etapa = cabecalho.get("etapa", "")
     codigo_pedido = cabecalho.get("codigo_pedido")
 
-    if etapa != ETAPA_FATURAR:
-        print(f"↪️ Pedido {numero_pedido} está na etapa {etapa}, não é a etapa de faturar. Ignorando.")
+    if etapa != ETAPA_SEPARACAO:
+        print(f"↪️ Pedido {numero_pedido} está na etapa {etapa}, não é separação. Ignorando.")
         return
 
     itens = dados.get("pedido_venda_produto", {}).get("det", [])
@@ -137,8 +137,8 @@ async def webhook_etapa_pedido(request: Request):
       "topic": "VendaProduto.EtapaAlterada",
       "event": {
         "numeroPedido": "34552",
-        "etapa": "50",
-        "etapaDescr": "Faturar",
+        "etapa": "20",
+        "etapaDescr": "Separação",
         "idPedido": 9190977970,
         "codIntPedido": "27772",
         ...
