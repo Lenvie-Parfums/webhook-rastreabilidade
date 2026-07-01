@@ -83,8 +83,8 @@ def alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado) -> dict:
             "cabecalho": {"codigo_pedido": codigo_pedido},
             "det": det_atualizado,
             "frete": {
-                "especie": "CAIXAS",
-                "marca": "LENVIE",
+                "especie_volumes": "CAIXAS",
+                "marca_volumes": "LENVIE",
             },
         }],
     }
