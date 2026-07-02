@@ -198,6 +198,11 @@ def _processar_remessa(cod_remessa: int, app_key_origem: str):
         quantidade = item.get("nQtde")
         val_unit = item.get("nValUnit")
 
+        # monta base do item — omite nValUnit se for 0 ou None (Omie rejeita com erro 302)
+        item_base = {"nCodProd": codigo_produto, "nCodIt": cod_item, "nQtde": quantidade}
+        if val_unit:
+            item_base["nValUnit"] = val_unit
+
         _desc, sku = consultar_produto(codigo_produto, app_key_origem)
 
         lote, validade_raw = None, None
@@ -206,12 +211,7 @@ def _processar_remessa(cod_remessa: int, app_key_origem: str):
 
         if not lote:
             print(f"⚠️ SKU {sku} (produto {codigo_produto}) sem lote no Neon. Incluindo item sem rastreabilidade.")
-            produtos_atualizados.append({
-                "nCodProd": codigo_produto,
-                "nCodIt": cod_item,
-                "nQtde": quantidade,
-                "nValUnit": val_unit,
-            })
+            produtos_atualizados.append(item_base)
             continue
 
         fab, val = _calcular_fabricacao_validade(validade_raw)
@@ -222,13 +222,7 @@ def _processar_remessa(cod_remessa: int, app_key_origem: str):
         if val:
             rastreabilidade["dataValidadeLote"] = val
 
-        produtos_atualizados.append({
-            "nCodProd": codigo_produto,
-            "nCodIt": cod_item,
-            "nQtde": quantidade,
-            "nValUnit": val_unit,
-            "rastreabilidade": rastreabilidade,
-        })
+        produtos_atualizados.append({**item_base, "rastreabilidade": rastreabilidade})
         algum_lote = True
 
     if not algum_lote:
