@@ -14,7 +14,10 @@ from datetime import date, datetime
 
 from fastapi import FastAPI, Request
 
-from utils.api_omie import consultar_pedido, consultar_produto, alterar_pedido_rastreabilidade
+from utils.api_omie import (
+    consultar_pedido, consultar_produto, alterar_pedido_rastreabilidade,
+    consultar_remessa, alterar_remessa_rastreabilidade,
+)
 from utils.neon_select import buscar_lote_validade
 
 app = FastAPI()
@@ -54,12 +57,12 @@ def _calcular_fabricacao_validade(validade_raw: str):
         return "", ""
 
 
-def processar_pedido(numero_pedido):
+def processar_pedido(numero_pedido, app_key_origem: str):
     if numero_pedido in _pedidos_processados:
         print(f"↪️ Pedido {numero_pedido} já processado nesta execução, ignorando.")
         return
 
-    dados = consultar_pedido(numero_pedido)
+    dados = consultar_pedido(numero_pedido, app_key_origem)
 
     cabecalho = dados.get("pedido_venda_produto", {}).get("cabecalho", {})
     etapa = cabecalho.get("etapa", "")
@@ -77,12 +80,9 @@ def processar_pedido(numero_pedido):
         produto = item.get("produto", {})
         codigo_produto = produto.get("codigo_produto")
 
-        # Código de integração do item: usa o que já existe no pedido, ou,
-        # se não houver (pedido criado manualmente), usa o número sequencial
-        # do item (1, 2, 3...) -- conforme orientação da doc Omie.
         codigo_item_integracao = item.get("ide", {}).get("codigo_item_integracao") or str(idx)
 
-        _descricao, sku = consultar_produto(codigo_produto)
+        _descricao, sku = consultar_produto(codigo_produto, app_key_origem)
 
         lote, validade_raw = (None, None)
         if sku:
@@ -98,8 +98,6 @@ def processar_pedido(numero_pedido):
             "numeroLote": lote,
             "qtdeProdutoLote": produto.get("quantidade"),
         }
-        # só inclui as datas se ambas forem válidas — campos vazios geram
-        # 'dVal: - -' no XML da NF-e e causam rejeição da SEFAZ (erro 1839)
         if fabricacao_str:
             rastreabilidade["dataFabricacaoLote"] = fabricacao_str
         if validade_str:
@@ -115,13 +113,135 @@ def processar_pedido(numero_pedido):
         print(f"⚠️ Nenhum lote encontrado para nenhum item do pedido {numero_pedido}. Nada gravado.")
         return
 
-    resultado = alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado)
+    resultado = alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado, app_key_origem)
     print(f"✅ Pedido {numero_pedido} atualizado: {resultado}")
 
     _pedidos_processados.add(numero_pedido)
 
 
-@app.get("/webhook/etapa-pedido")
+_remessas_processadas = set()
+
+
+def processar_remessa(cod_remessa: int, app_key_origem: str):
+    if cod_remessa in _remessas_processadas:
+        print(f"↪️ Remessa {cod_remessa} já processada nesta execução, ignorando.")
+        return
+
+    dados = consultar_remessa(cod_remessa, app_key_origem)
+
+    cabec = dados.get("cabec", {})
+    cod_cliente = cabec.get("nCodCli")
+    numero_remessa = cabec.get("cNumeroRemessa", cod_remessa)
+
+    itens = dados.get("produtos", [])
+    produtos_atualizados = []
+    algum_lote_encontrado = False
+
+    for item in itens:
+        codigo_produto = item.get("nCodProd")
+        cod_item       = item.get("nCodIt")
+        quantidade     = item.get("nQtde")
+        val_unit       = item.get("nValUnit")
+
+        _descricao, sku = consultar_produto(codigo_produto, app_key_origem)
+
+        lote, validade_raw = (None, None)
+        if sku:
+            lote, validade_raw = buscar_lote_validade(sku)
+
+        if not lote:
+            print(f"⚠️ SKU {sku} (produto {codigo_produto}) sem lote no Neon. Pulando item.")
+            # inclui o item sem rastreabilidade pra não remover do payload
+            produtos_atualizados.append({
+                "nCodProd": codigo_produto,
+                "nCodIt":   cod_item,
+                "nQtde":    quantidade,
+                "nValUnit": val_unit,
+            })
+            continue
+
+        fabricacao_str, validade_str = _calcular_fabricacao_validade(validade_raw)
+
+        rastreabilidade = {
+            "numeroLote":      lote,
+            "qtdeProdutoLote": quantidade,
+        }
+        if fabricacao_str:
+            rastreabilidade["dataFabricacaoLote"] = fabricacao_str
+        if validade_str:
+            rastreabilidade["dataValidadeLote"] = validade_str
+
+        produtos_atualizados.append({
+            "nCodProd":        codigo_produto,
+            "nCodIt":          cod_item,
+            "nQtde":           quantidade,
+            "nValUnit":        val_unit,
+            "rastreabilidade": rastreabilidade,
+        })
+        algum_lote_encontrado = True
+
+    if not algum_lote_encontrado:
+        print(f"⚠️ Nenhum lote encontrado pra nenhum item da remessa {numero_remessa}. Nada gravado.")
+        return
+
+    resultado = alterar_remessa_rastreabilidade(cod_remessa, cod_cliente, produtos_atualizados, app_key_origem)
+    print(f"✅ Remessa {numero_remessa} atualizada: {resultado}")
+
+    _remessas_processadas.add(cod_remessa)
+
+
+@app.get("/webhook/remessa-criada")
+def webhook_remessa_check():
+    """Responde ao teste de validação que o Omie faz ao salvar o webhook."""
+    return {"status": "ok"}
+
+
+@app.post("/webhook/remessa-criada")
+async def webhook_remessa_criada(request: Request):
+    """
+    Escuta o evento RemessaProduto.Incluida do Omie (Matriz e 003).
+    Payload esperado (mesmo padrão do VendaProduto.EtapaAlterada):
+
+    {
+      "topic": "RemessaProduto.Incluida",
+      "event": {
+        "nCodRem": 12345,
+        "cNumeroRemessa": "001",
+        ...
+      },
+      "appKey": "...",
+      ...
+    }
+
+    ⚠️ Os campos exatos do event precisam ser confirmados via teste com
+    RequestBin/Pipedream na primeira remessa criada após ativar o webhook.
+    """
+    payload = await request.json()
+    print("===== WEBHOOK REMESSA RECEBIDO =====")
+    print(payload)
+    print("=====================================")
+
+    topico = payload.get("topic")
+    if topico != "RemessaProduto.Incluida":
+        print(f"↪️ Tópico '{topico}' não é RemessaProduto.Incluida. Ignorando.")
+        return {"status": "ignorado", "motivo": "topico não monitorado"}
+
+    evento = payload.get("event", {})
+    app_key_origem = payload.get("appKey", "")
+
+    # tenta extrair o código interno da remessa — confirmar campo exato via teste
+    cod_remessa = evento.get("nCodRem") or evento.get("codRem") or evento.get("id")
+
+    if not cod_remessa:
+        print("❌ Não foi possível identificar nCodRem no payload.")
+        return {"status": "ignorado", "motivo": "nCodRem não encontrado"}
+
+    try:
+        processar_remessa(int(cod_remessa), app_key_origem)
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"❌ Erro ao processar remessa {cod_remessa}: {e}")
+        return {"status": "erro", "mensagem": str(e)}
 def webhook_etapa_pedido_check():
     """Responde ao teste de validação que o Omie faz ao salvar o webhook."""
     return {"status": "ok"}
@@ -161,6 +281,7 @@ async def webhook_etapa_pedido(request: Request):
     evento = payload.get("event", {})
     numero_pedido = evento.get("numeroPedido")
     etapa = evento.get("etapa")
+    app_key_origem = payload.get("appKey", "")
 
     if not numero_pedido:
         print("❌ Não foi possível identificar o numeroPedido no payload.")
@@ -171,7 +292,7 @@ async def webhook_etapa_pedido(request: Request):
         return {"status": "ignorado", "motivo": f"etapa {etapa} não monitorada"}
 
     try:
-        processar_pedido(numero_pedido)
+        processar_pedido(numero_pedido, app_key_origem)
         return {"status": "ok"}
     except Exception as e:
         print(f"❌ Erro ao processar pedido {numero_pedido}: {e}")
