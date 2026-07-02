@@ -200,21 +200,21 @@ def webhook_remessa_check():
 async def webhook_remessa_criada(request: Request):
     """
     Escuta o evento RemessaProduto.Incluida do Omie (Matriz e 003).
-    Payload esperado (mesmo padrão do VendaProduto.EtapaAlterada):
+    Payload real confirmado via teste:
 
     {
       "topic": "RemessaProduto.Incluida",
       "event": {
-        "nCodRem": 12345,
-        "cNumeroRemessa": "001",
+        "idRemessa": 4081384374,
+        "numeroRemessa": "2952",
+        "idCliente": 3554834118,
+        "etapa": "10",
+        "dataInclusao": "02/07/2026",
         ...
       },
       "appKey": "...",
       ...
     }
-
-    ⚠️ Os campos exatos do event precisam ser confirmados via teste com
-    RequestBin/Pipedream na primeira remessa criada após ativar o webhook.
     """
     payload = await request.json()
     print("===== WEBHOOK REMESSA RECEBIDO =====")
@@ -229,8 +229,8 @@ async def webhook_remessa_criada(request: Request):
     evento = payload.get("event", {})
     app_key_origem = payload.get("appKey", "")
 
-    # tenta extrair o código interno da remessa — confirmar campo exato via teste
-    cod_remessa = evento.get("nCodRem") or evento.get("codRem") or evento.get("id")
+    # campo confirmado via teste real: 'idRemessa'
+    cod_remessa = evento.get("idRemessa") or evento.get("nCodRem") or evento.get("codRem")
 
     if not cod_remessa:
         print("❌ Não foi possível identificar nCodRem no payload.")
