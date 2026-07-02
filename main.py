@@ -1,22 +1,27 @@
 """
 Webhook de Rastreabilidade Automática
 ======================================
-Dois fluxos cobertos:
+Preenche lote/validade + espécie/marca de volumes automaticamente, cobrindo
+dois documentos e duas empresas (Matriz e Manifesto 003, roteadas por appKey).
 
-1. Pedido de Venda (Matriz e 003)
-   Tópico : VendaProduto.EtapaAlterada (case-insensitive)
-   Gatilho: etapa == "20" (Separação)
-   Ação   : AlterarPedidoVenda com rastreabilidade + especie/marca frete
+FLUXO PEDIDO DE VENDA
+  Tópico  : VendaProduto.EtapaAlterada (case-insensitive)
+  Gatilhos: etapas 10, 20 e 50 (gravação progressiva)
+  Regra   : cada etapa grava tudo que encontrar no Neon. Se a chamada ao Omie
+            volta SEM erro técnico, o pedido é marcado como resolvido e as
+            etapas seguintes saem na hora (sem tocar no Omie). Se a chamada
+            falhar (rede/timeout/faultstring), a próxima etapa retenta.
+            SKU que não existe no Neon é descartado — não bloqueia nem conta.
 
-2. Remessa (Matriz e 003)
-   Tópico : RemessaProduto.Alterada (case-insensitive)
-   Gatilho: criação de qualquer remessa
-   Ação   : AlterarRemessa com rastreabilidade + especie/marca frete
+FLUXO REMESSA
+  Tópico  : RemessaProduto.Alterada (case-insensitive)
+  Gatilho : qualquer alteração da remessa (a criação vem vazia; os produtos
+            chegam numa alteração posterior)
+  Regra   : mesma lógica de resolvido/retry do pedido.
 
 Deploy: Render — mesmo padrão do projeto FRI Matriz -> ATIVA.
 """
 
-import json
 from datetime import date, datetime
 
 from fastapi import FastAPI, Request
@@ -32,27 +37,31 @@ from utils.neon_select import buscar_lote_validade
 
 app = FastAPI()
 
-ETAPA_SEPARACAO = "20"
+ETAPAS_MONITORADAS = {"10", "20", "50"}
 
-_pedidos_processados: set = set()
-_remessas_processadas: set = set()
+# pedidos cuja gravação no Omie já retornou sem erro — pulam direto.
+# Remessa NÃO tem cache: pode receber itens novos/corrigidos a qualquer momento,
+# então toda alteração é reprocessada (com guard anti-loop por comparação).
+_pedidos_resolvidos: set = set()
 
 
 # ── UTILITÁRIOS ────────────────────────────────────────────────────────────────
 
 def _calcular_fabricacao_validade(validade_raw: str):
-    """Aceita MM/YYYY ou DD/MM/YYYY. Retorna (fabricacao, validade) no formato DD/MM/YYYY."""
-    if not validade_raw or validade_raw.strip() in ("S/V", "-", ""):
+    """Aceita MM/YYYY ou DD/MM/YYYY. Retorna (fabricacao, validade) em DD/MM/YYYY.
+    Retorna ("", "") se a validade for inválida — evita 'dVal: - -' na NF-e."""
+    if not validade_raw or str(validade_raw).strip() in ("S/V", "-", ""):
         return "", ""
     try:
-        partes = validade_raw.strip().split("/")
+        texto = str(validade_raw).strip()
+        partes = texto.split("/")
         if len(partes) == 2:
             mes, ano = int(partes[0]), int(partes[1])
             if ano < 100:
                 ano += 2000
             validade_dt = date(ano, mes, 1)
         else:
-            validade_dt = datetime.strptime(validade_raw.strip(), "%d/%m/%Y").date()
+            validade_dt = datetime.strptime(texto, "%d/%m/%Y").date()
 
         fabricacao_dt = date(validade_dt.year - 3, validade_dt.month, validade_dt.day)
         return fabricacao_dt.strftime("%d/%m/%Y"), validade_dt.strftime("%d/%m/%Y")
@@ -62,9 +71,25 @@ def _calcular_fabricacao_validade(validade_raw: str):
 
 
 def _topico_match(payload: dict, esperado: str) -> bool:
-    """Compara tópico do payload com o esperado de forma case-insensitive e segura."""
+    """Comparação de tópico case-insensitive e segura contra None."""
     topico = payload.get("topic") or ""
     return topico.lower() == esperado.lower()
+
+
+def _tem_erro(resultado: dict) -> bool:
+    """True se a resposta do Omie contém erro técnico (faultstring)."""
+    return isinstance(resultado, dict) and "faultstring" in resultado
+
+
+def _montar_rastreabilidade(lote, quantidade, validade_raw):
+    """Monta o bloco de rastreabilidade, incluindo datas só se forem válidas."""
+    fab, val = _calcular_fabricacao_validade(validade_raw)
+    rast = {"numeroLote": lote, "qtdeProdutoLote": quantidade}
+    if fab:
+        rast["dataFabricacaoLote"] = fab
+    if val:
+        rast["dataValidadeLote"] = val
+    return rast
 
 
 # ── HEALTH CHECK ───────────────────────────────────────────────────────────────
@@ -77,23 +102,20 @@ def health():
 # ── PEDIDO DE VENDA ────────────────────────────────────────────────────────────
 
 def _processar_pedido(numero_pedido: str, app_key_origem: str):
-    if numero_pedido in _pedidos_processados:
-        print(f"↪️ Pedido {numero_pedido} já processado nesta execução, ignorando.")
+    if numero_pedido in _pedidos_resolvidos:
+        print(f"↪️ Pedido {numero_pedido} já resolvido. Ignorando.")
         return
 
     dados = consultar_pedido(numero_pedido, app_key_origem)
-    cabecalho = dados.get("pedido_venda_produto", {}).get("cabecalho", {})
-    etapa = cabecalho.get("etapa", "")
-    codigo_pedido = cabecalho.get("codigo_pedido")
-
-    if etapa != ETAPA_SEPARACAO:
-        print(f"↪️ Pedido {numero_pedido} está na etapa {etapa}, não é separação. Ignorando.")
+    if _tem_erro(dados):
+        print(f"❌ Erro ao consultar pedido {numero_pedido}: {dados.get('faultstring')}")
         return
 
+    cabecalho = dados.get("pedido_venda_produto", {}).get("cabecalho", {})
+    codigo_pedido = cabecalho.get("codigo_pedido")
     itens = dados.get("pedido_venda_produto", {}).get("det", [])
-    det_atualizado = []
-    algum_lote = False
 
+    det_atualizado = []
     for idx, item in enumerate(itens, start=1):
         produto = item.get("produto", {})
         codigo_produto = produto.get("codigo_produto")
@@ -101,35 +123,33 @@ def _processar_pedido(numero_pedido: str, app_key_origem: str):
 
         _desc, sku = consultar_produto(codigo_produto, app_key_origem)
 
-        lote, validade_raw = None, None
+        lote, validade_raw = (None, None)
         if sku:
             lote, validade_raw = buscar_lote_validade(sku)
 
         if not lote:
-            print(f"⚠️ SKU {sku} (produto {codigo_produto}) sem lote no Neon. Pulando item.")
+            # SKU sem lote no Neon: descarta o item (não bloqueia, não retenta)
             continue
-
-        fab, val = _calcular_fabricacao_validade(validade_raw)
-
-        rastreabilidade = {"numeroLote": lote, "qtdeProdutoLote": produto.get("quantidade")}
-        if fab:
-            rastreabilidade["dataFabricacaoLote"] = fab
-        if val:
-            rastreabilidade["dataValidadeLote"] = val
 
         det_atualizado.append({
             "ide": {"codigo_item_integracao": codigo_item_integracao},
-            "rastreabilidade": rastreabilidade,
+            "rastreabilidade": _montar_rastreabilidade(lote, produto.get("quantidade"), validade_raw),
         })
-        algum_lote = True
 
-    if not algum_lote:
-        print(f"⚠️ Nenhum lote encontrado para o pedido {numero_pedido}. Nada gravado.")
+    if not det_atualizado:
+        print(f"↪️ Pedido {numero_pedido}: nenhum item com lote no Neon. Nada a gravar.")
+        # marca como resolvido — não há o que gravar, não adianta retentar
+        _pedidos_resolvidos.add(numero_pedido)
         return
 
     resultado = alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado, app_key_origem)
-    print(f"✅ Pedido {numero_pedido} atualizado: {resultado}")
-    _pedidos_processados.add(numero_pedido)
+
+    if _tem_erro(resultado):
+        print(f"❌ Pedido {numero_pedido} falhou ao gravar: {resultado.get('faultstring')} — retry na próxima etapa.")
+        return
+
+    print(f"✅ Pedido {numero_pedido} gravado ({len(det_atualizado)} item(ns)): {resultado}")
+    _pedidos_resolvidos.add(numero_pedido)
 
 
 @app.get("/webhook/etapa-pedido")
@@ -145,8 +165,7 @@ async def webhook_etapa_pedido(request: Request):
     print("===================================")
 
     if not _topico_match(payload, "VendaProduto.EtapaAlterada"):
-        topico = payload.get("topic", "")
-        print(f"↪️ Tópico '{topico}' ignorado.")
+        print(f"↪️ Tópico '{payload.get('topic', '')}' ignorado.")
         return {"status": "ignorado", "motivo": "topico não monitorado"}
 
     evento = payload.get("event", {})
@@ -158,8 +177,8 @@ async def webhook_etapa_pedido(request: Request):
         print("❌ numeroPedido não encontrado no payload.")
         return {"status": "ignorado", "motivo": "numeroPedido não encontrado"}
 
-    if etapa != ETAPA_SEPARACAO:
-        print(f"↪️ Pedido {numero_pedido} foi pra etapa {etapa}, não é separação. Ignorando.")
+    if etapa not in ETAPAS_MONITORADAS:
+        print(f"↪️ Pedido {numero_pedido} foi pra etapa {etapa}. Ignorando.")
         return {"status": "ignorado", "motivo": f"etapa {etapa} não monitorada"}
 
     try:
@@ -173,65 +192,75 @@ async def webhook_etapa_pedido(request: Request):
 # ── REMESSA ────────────────────────────────────────────────────────────────────
 
 def _processar_remessa(cod_remessa: int, app_key_origem: str):
-    if cod_remessa in _remessas_processadas:
-        print(f"↪️ Remessa {cod_remessa} já processada nesta execução, ignorando.")
-        return
-
+    # Sem cache: remessa pode receber itens novos/corrigidos a qualquer momento.
+    # A proteção contra loop é feita por comparação (só grava se houver mudança).
     dados = consultar_remessa(cod_remessa, app_key_origem)
-
-    # log completo pra confirmar estrutura real do retorno do Omie
-    print(f"===== DADOS DA REMESSA {cod_remessa} =====")
-    print(json.dumps(dados, indent=2, ensure_ascii=False, default=str))
-    print("==========================================")
+    if _tem_erro(dados):
+        print(f"❌ Erro ao consultar remessa {cod_remessa}: {dados.get('faultstring')}")
+        return
 
     cabec = dados.get("cabec", {})
     cod_cliente = cabec.get("nCodCli")
     numero_remessa = cabec.get("cNumeroRemessa", str(cod_remessa))
 
     itens = dados.get("produtos", [])
-    produtos_atualizados = []
-    algum_lote = False
+    if not itens:
+        print(f"↪️ Remessa {numero_remessa} ainda sem produtos. Aguardando próxima alteração.")
+        return
+
+    produtos = []
+    itens_com_lote = 0
+    precisa_gravar = False
 
     for item in itens:
         codigo_produto = item.get("nCodProd")
-        cod_item = item.get("nCodIt")
-        quantidade = item.get("nQtde")
         val_unit = item.get("nValUnit")
 
-        # monta base do item — omite nValUnit se for 0 ou None (Omie rejeita com erro 302)
-        item_base = {"nCodProd": codigo_produto, "nCodIt": cod_item, "nQtde": quantidade}
+        # base do item — omite nValUnit se for 0/None (Omie rejeita com erro 302)
+        item_base = {
+            "nCodProd": codigo_produto,
+            "nCodIt": item.get("nCodIt"),
+            "nQtde": item.get("nQtde"),
+        }
         if val_unit:
             item_base["nValUnit"] = val_unit
 
         _desc, sku = consultar_produto(codigo_produto, app_key_origem)
 
-        lote, validade_raw = None, None
+        lote, validade_raw = (None, None)
         if sku:
             lote, validade_raw = buscar_lote_validade(sku)
 
         if not lote:
-            print(f"⚠️ SKU {sku} (produto {codigo_produto}) sem lote no Neon. Incluindo item sem rastreabilidade.")
-            produtos_atualizados.append(item_base)
+            # SKU sem lote no Neon: mantém o item, sem rastreabilidade
+            produtos.append(item_base)
             continue
 
-        fab, val = _calcular_fabricacao_validade(validade_raw)
+        rast = _montar_rastreabilidade(lote, item.get("nQtde"), validade_raw)
+        produtos.append({**item_base, "rastreabilidade": rast})
+        itens_com_lote += 1
 
-        rastreabilidade = {"numeroLote": lote, "qtdeProdutoLote": quantidade}
-        if fab:
-            rastreabilidade["dataFabricacaoLote"] = fab
-        if val:
-            rastreabilidade["dataValidadeLote"] = val
+        # guard anti-loop: só marca "precisa gravar" se o lote atual do item
+        # for diferente do que vamos gravar (evita regravar o que já está certo)
+        lote_atual = (item.get("rastreabilidade") or {}).get("numeroLote", "")
+        if str(lote_atual).strip() != str(lote).strip():
+            precisa_gravar = True
 
-        produtos_atualizados.append({**item_base, "rastreabilidade": rastreabilidade})
-        algum_lote = True
-
-    if not algum_lote:
-        print(f"⚠️ Nenhum lote encontrado para a remessa {numero_remessa}. Nada gravado.")
+    if itens_com_lote == 0:
+        print(f"↪️ Remessa {numero_remessa}: nenhum item com lote no Neon. Nada a gravar.")
         return
 
-    resultado = alterar_remessa_rastreabilidade(cod_remessa, cod_cliente, produtos_atualizados, app_key_origem)
-    print(f"✅ Remessa {numero_remessa} atualizada: {resultado}")
-    _remessas_processadas.add(cod_remessa)
+    if not precisa_gravar:
+        print(f"↪️ Remessa {numero_remessa}: lotes já gravados e corretos. Nada a fazer (anti-loop).")
+        return
+
+    resultado = alterar_remessa_rastreabilidade(cod_remessa, cod_cliente, produtos, app_key_origem)
+
+    if _tem_erro(resultado):
+        print(f"❌ Remessa {numero_remessa} falhou ao gravar: {resultado.get('faultstring')} — retry na próxima alteração.")
+        return
+
+    print(f"✅ Remessa {numero_remessa} gravada ({itens_com_lote} item(ns) com lote): {resultado}")
 
 
 @app.get("/webhook/remessa-criada")
@@ -247,8 +276,7 @@ async def webhook_remessa_criada(request: Request):
     print("=====================================")
 
     if not _topico_match(payload, "RemessaProduto.Alterada"):
-        topico = payload.get("topic", "")
-        print(f"↪️ Tópico '{topico}' ignorado.")
+        print(f"↪️ Tópico '{payload.get('topic', '')}' ignorado.")
         return {"status": "ignorado", "motivo": "topico não monitorado"}
 
     evento = payload.get("event", {})
