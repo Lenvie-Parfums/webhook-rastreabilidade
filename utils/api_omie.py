@@ -105,12 +105,7 @@ def consultar_remessa(cod_remessa: int, app_key_origem: str) -> dict:
 def alterar_remessa_rastreabilidade(cod_remessa: int, cod_cliente: int, produtos: list, app_key_origem: str) -> dict:
     """
     Grava lote/validade nos itens da remessa + especie/marca nos volumes.
-
-    produtos: lista de dicts com nCodProd, nCodIt, nQtde, nValUnit, rastreabilidade.
-
-    Nota: os nomes dos campos de especie/marca no frete da remessa precisam ser
-    confirmados via teste (podem ser cEmbalagem/cMarca ou especie_volumes/marca_volumes
-    igual ao pedido). O log do JSON enviado vai mostrar se o Omie aceitou.
+    Campos de frete confirmados via ConsultarRemessa: cEspVol e cMarVol.
     """
     app_key, app_secret = _get_credenciais(app_key_origem)
     payload = {
@@ -123,8 +118,8 @@ def alterar_remessa_rastreabilidade(cod_remessa: int, cod_cliente: int, produtos
                 "nCodCli": cod_cliente,
             },
             "frete": {
-                "cEspecie": "CAIXAS",
-                "cMarca":   "LENVIE",
+                "cEspVol": "CAIXAS",
+                "cMarVol": "LENVIE",
             },
             "produtos": produtos,
         }],
