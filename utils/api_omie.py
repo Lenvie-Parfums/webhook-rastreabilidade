@@ -1,163 +1,299 @@
+"""
+Webhook de Rastreabilidade Automática
+======================================
+Recebe a notificação do Omie quando um Pedido de Venda muda de etapa.
+Quando a etapa nova é "20" (Separação), busca lote/validade no Neon
+(tblotematriz), grava automaticamente no pedido via AlterarPedidoVenda
+e preenche especie_volumes/marca_volumes no frete.
+
+Deploy: Render (mesmo padrão do projeto FRI Matriz -> ATIVA).
+"""
+
 import os
-import re
-import time
-import json
-from typing import Optional, Tuple
+from datetime import date, datetime
 
-import requests
+from fastapi import FastAPI, Request
 
-APP_KEY_MATRIZ = os.environ["APP_KEY"]
-APP_SECRET_MATRIZ = os.environ["APP_SECRET"]
-APP_KEY_003 = os.environ["APP_KEY_003"]
-APP_SECRET_003 = os.environ["APP_SECRET_003"]
+from utils.api_omie import (
+    consultar_pedido, consultar_produto, alterar_pedido_rastreabilidade,
+    consultar_remessa, alterar_remessa_rastreabilidade,
+)
+from utils.neon_select import buscar_lote_validade
 
-URL_PEDIDO  = "https://app.omie.com.br/api/v1/produtos/pedido/"
-URL_REMESSA = "https://app.omie.com.br/api/v1/produtos/remessa/"
-URL_PRODUTO = "https://app.omie.com.br/api/v1/geral/produtos/"
+app = FastAPI()
 
-# cache simples em memória pra não bater 2x no mesmo produto durante um pedido
-_cache_produto = {}
+ETAPA_SEPARACAO = "20"
 
-
-def _get_credenciais(app_key_origem: str):
-    """Retorna (app_key, app_secret) corretos com base no appKey que veio no payload."""
-    if app_key_origem == APP_KEY_003:
-        return APP_KEY_003, APP_SECRET_003
-    return APP_KEY_MATRIZ, APP_SECRET_MATRIZ
+# guarda em memória os pedidos já processados nesta execução,
+# pra não duplicar trabalho se o Omie reenviar o mesmo webhook
+_pedidos_processados = set()
 
 
-def _chamada_omie(url, payload, tentativas=4):
-    """Wrapper genérico com retry em rate limit e timeout, igual ao padrão que você já usa."""
-    for tentativa in range(1, tentativas + 1):
-        try:
-            response = requests.post(url, json=payload, timeout=60)
-            resultado = response.json()
-        except requests.exceptions.Timeout:
-            print(f"⏱️ Timeout na tentativa {tentativa}/{tentativas}. Aguardando 10s antes de tentar novamente...")
-            time.sleep(10)
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+
+def _calcular_fabricacao_validade(validade_raw: str):
+    """Mesma lógica do app Streamlit: aceita MM/YYYY ou DD/MM/YYYY,
+    e calcula fabricação = validade - 3 anos."""
+    if not validade_raw or validade_raw in ("S/V", "-"):
+        return "", ""
+
+    try:
+        if len(validade_raw.split("/")) == 2:
+            mes, ano = validade_raw.split("/")
+            mes = int(mes)
+            ano = int(ano) + 2000 if int(ano) < 100 else int(ano)
+            validade_dt = date(ano, mes, 1)
+        else:
+            validade_dt = datetime.strptime(validade_raw, "%d/%m/%Y").date()
+
+        fabricacao_dt = date(validade_dt.year - 3, validade_dt.month, validade_dt.day)
+
+        return fabricacao_dt.strftime("%d/%m/%Y"), validade_dt.strftime("%d/%m/%Y")
+    except Exception as e:
+        print(f"⚠️ Erro ao converter validade '{validade_raw}': {e}")
+        return "", ""
+
+
+def processar_pedido(numero_pedido, app_key_origem: str):
+    if numero_pedido in _pedidos_processados:
+        print(f"↪️ Pedido {numero_pedido} já processado nesta execução, ignorando.")
+        return
+
+    dados = consultar_pedido(numero_pedido, app_key_origem)
+
+    cabecalho = dados.get("pedido_venda_produto", {}).get("cabecalho", {})
+    etapa = cabecalho.get("etapa", "")
+    codigo_pedido = cabecalho.get("codigo_pedido")
+
+    if etapa != ETAPA_SEPARACAO:
+        print(f"↪️ Pedido {numero_pedido} está na etapa {etapa}, não é separação. Ignorando.")
+        return
+
+    itens = dados.get("pedido_venda_produto", {}).get("det", [])
+    det_atualizado = []
+    algum_lote_encontrado = False
+
+    for idx, item in enumerate(itens, start=1):
+        produto = item.get("produto", {})
+        codigo_produto = produto.get("codigo_produto")
+
+        codigo_item_integracao = item.get("ide", {}).get("codigo_item_integracao") or str(idx)
+
+        _descricao, sku = consultar_produto(codigo_produto, app_key_origem)
+
+        lote, validade_raw = (None, None)
+        if sku:
+            lote, validade_raw = buscar_lote_validade(sku)
+
+        if not lote:
+            print(f"⚠️ SKU {sku} (produto {codigo_produto}) sem lote cadastrado no Neon. Pulando rastreabilidade deste item.")
             continue
 
-        fault = resultado.get("faultstring", "")
-        if fault.startswith("ERROR: Consumo redundante") or "MISUSE" in fault or "REDUNDANT" in fault:
-            match = re.search(r"Aguarde (\d+) segundos", fault) or re.search(r"(\d+) segundos", fault)
-            segundos = int(match.group(1)) if match else 6
-            print(f"⚠️ Rate limit. Aguardando {segundos}s (tentativa {tentativa}/{tentativas})...")
-            time.sleep(segundos)
+        fabricacao_str, validade_str = _calcular_fabricacao_validade(validade_raw)
+
+        rastreabilidade = {
+            "numeroLote": lote,
+            "qtdeProdutoLote": produto.get("quantidade"),
+        }
+        if fabricacao_str:
+            rastreabilidade["dataFabricacaoLote"] = fabricacao_str
+        if validade_str:
+            rastreabilidade["dataValidadeLote"] = validade_str
+
+        det_atualizado.append({
+            "ide": {"codigo_item_integracao": codigo_item_integracao},
+            "rastreabilidade": rastreabilidade,
+        })
+        algum_lote_encontrado = True
+
+    if not algum_lote_encontrado:
+        print(f"⚠️ Nenhum lote encontrado para nenhum item do pedido {numero_pedido}. Nada gravado.")
+        return
+
+    resultado = alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado, app_key_origem)
+    print(f"✅ Pedido {numero_pedido} atualizado: {resultado}")
+
+    _pedidos_processados.add(numero_pedido)
+
+
+_remessas_processadas = set()
+
+
+def processar_remessa(cod_remessa: int, app_key_origem: str):
+    if cod_remessa in _remessas_processadas:
+        print(f"↪️ Remessa {cod_remessa} já processada nesta execução, ignorando.")
+        return
+
+    dados = consultar_remessa(cod_remessa, app_key_origem)
+
+    cabec = dados.get("cabec", {})
+    cod_cliente = cabec.get("nCodCli")
+    numero_remessa = cabec.get("cNumeroRemessa", cod_remessa)
+
+    itens = dados.get("produtos", [])
+    produtos_atualizados = []
+    algum_lote_encontrado = False
+
+    for item in itens:
+        codigo_produto = item.get("nCodProd")
+        cod_item       = item.get("nCodIt")
+        quantidade     = item.get("nQtde")
+        val_unit       = item.get("nValUnit")
+
+        _descricao, sku = consultar_produto(codigo_produto, app_key_origem)
+
+        lote, validade_raw = (None, None)
+        if sku:
+            lote, validade_raw = buscar_lote_validade(sku)
+
+        if not lote:
+            print(f"⚠️ SKU {sku} (produto {codigo_produto}) sem lote no Neon. Pulando item.")
+            # inclui o item sem rastreabilidade pra não remover do payload
+            produtos_atualizados.append({
+                "nCodProd": codigo_produto,
+                "nCodIt":   cod_item,
+                "nQtde":    quantidade,
+                "nValUnit": val_unit,
+            })
             continue
 
-        return resultado
+        fabricacao_str, validade_str = _calcular_fabricacao_validade(validade_raw)
 
-    print("❌ Todas as tentativas usadas, retornando último resultado")
-    return resultado
+        rastreabilidade = {
+            "numeroLote":      lote,
+            "qtdeProdutoLote": quantidade,
+        }
+        if fabricacao_str:
+            rastreabilidade["dataFabricacaoLote"] = fabricacao_str
+        if validade_str:
+            rastreabilidade["dataValidadeLote"] = validade_str
 
+        produtos_atualizados.append({
+            "nCodProd":        codigo_produto,
+            "nCodIt":          cod_item,
+            "nQtde":           quantidade,
+            "nValUnit":        val_unit,
+            "rastreabilidade": rastreabilidade,
+        })
+        algum_lote_encontrado = True
 
-# ── PEDIDO DE VENDA ────────────────────────────────────────────────────────────
+    if not algum_lote_encontrado:
+        print(f"⚠️ Nenhum lote encontrado pra nenhum item da remessa {numero_remessa}. Nada gravado.")
+        return
 
-def consultar_pedido(numero_pedido, app_key_origem: str) -> dict:
-    app_key, app_secret = _get_credenciais(app_key_origem)
-    payload = {
-        "call": "ConsultarPedido",
-        "app_key": app_key,
-        "app_secret": app_secret,
-        "param": [{"numero_pedido": numero_pedido}],
-    }
-    return _chamada_omie(URL_PEDIDO, payload)
+    resultado = alterar_remessa_rastreabilidade(cod_remessa, cod_cliente, produtos_atualizados, app_key_origem)
+    print(f"✅ Remessa {numero_remessa} atualizada: {resultado}")
 
-
-def alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado, app_key_origem: str) -> dict:
-    """Grava lote/validade nos itens e campos de frete via AlterarPedidoVenda."""
-    app_key, app_secret = _get_credenciais(app_key_origem)
-    payload = {
-        "call": "AlterarPedidoVenda",
-        "app_key": app_key,
-        "app_secret": app_secret,
-        "param": [{
-            "cabecalho": {"codigo_pedido": codigo_pedido},
-            "det": det_atualizado,
-            "frete": {
-                "especie_volumes": "CAIXAS",
-                "marca_volumes": "LENVIE",
-            },
-        }],
-    }
-
-    print("\n===== JSON ENVIADO (AlterarPedidoVenda) =====")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    print("==============================================")
-
-    return _chamada_omie(URL_PEDIDO, payload)
+    _remessas_processadas.add(cod_remessa)
 
 
-# ── REMESSA ────────────────────────────────────────────────────────────────────
-
-def consultar_remessa(cod_remessa: int, app_key_origem: str) -> dict:
-    """Consulta detalhes completos de uma remessa pelo código interno Omie."""
-    app_key, app_secret = _get_credenciais(app_key_origem)
-    payload = {
-        "call": "ConsultarRemessa",
-        "app_key": app_key,
-        "app_secret": app_secret,
-        "param": [{"nCodRem": cod_remessa}],
-    }
-    return _chamada_omie(URL_REMESSA, payload)
+@app.get("/webhook/remessa-criada")
+def webhook_remessa_check():
+    """Responde ao teste de validação que o Omie faz ao salvar o webhook."""
+    return {"status": "ok"}
 
 
-def alterar_remessa_rastreabilidade(cod_remessa: int, cod_cliente: int, produtos: list, app_key_origem: str) -> dict:
+@app.post("/webhook/remessa-criada")
+async def webhook_remessa_criada(request: Request):
     """
-    Grava lote/validade nos itens da remessa + especie/marca nos volumes.
+    Escuta o evento RemessaProduto.Incluida do Omie (Matriz e 003).
+    Payload esperado (mesmo padrão do VendaProduto.EtapaAlterada):
 
-    produtos: lista de dicts com nCodProd, nCodIt, nQtde, nValUnit, rastreabilidade.
+    {
+      "topic": "RemessaProduto.Incluida",
+      "event": {
+        "nCodRem": 12345,
+        "cNumeroRemessa": "001",
+        ...
+      },
+      "appKey": "...",
+      ...
+    }
 
-    Nota: os nomes dos campos de especie/marca no frete da remessa precisam ser
-    confirmados via teste (podem ser cEmbalagem/cMarca ou especie_volumes/marca_volumes
-    igual ao pedido). O log do JSON enviado vai mostrar se o Omie aceitou.
+    ⚠️ Os campos exatos do event precisam ser confirmados via teste com
+    RequestBin/Pipedream na primeira remessa criada após ativar o webhook.
     """
-    app_key, app_secret = _get_credenciais(app_key_origem)
-    payload = {
-        "call": "AlterarRemessa",
-        "app_key": app_key,
-        "app_secret": app_secret,
-        "param": [{
-            "cabec": {
-                "nCodRem": cod_remessa,
-                "nCodCli": cod_cliente,
-            },
-            "frete": {
-                "cEspecie": "CAIXAS",
-                "cMarca":   "LENVIE",
-            },
-            "produtos": produtos,
-        }],
+    payload = await request.json()
+    print("===== WEBHOOK REMESSA RECEBIDO =====")
+    print(payload)
+    print("=====================================")
+
+    topico = payload.get("topic")
+    if topico != "RemessaProduto.Incluida":
+        print(f"↪️ Tópico '{topico}' não é RemessaProduto.Incluida. Ignorando.")
+        return {"status": "ignorado", "motivo": "topico não monitorado"}
+
+    evento = payload.get("event", {})
+    app_key_origem = payload.get("appKey", "")
+
+    # tenta extrair o código interno da remessa — confirmar campo exato via teste
+    cod_remessa = evento.get("nCodRem") or evento.get("codRem") or evento.get("id")
+
+    if not cod_remessa:
+        print("❌ Não foi possível identificar nCodRem no payload.")
+        return {"status": "ignorado", "motivo": "nCodRem não encontrado"}
+
+    try:
+        processar_remessa(int(cod_remessa), app_key_origem)
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"❌ Erro ao processar remessa {cod_remessa}: {e}")
+        return {"status": "erro", "mensagem": str(e)}
+def webhook_etapa_pedido_check():
+    """Responde ao teste de validação que o Omie faz ao salvar o webhook."""
+    return {"status": "ok"}
+
+
+@app.post("/webhook/etapa-pedido")
+async def webhook_etapa_pedido(request: Request):
+    """
+    Formato real confirmado pelo webhook do Omie em produção:
+
+    {
+      "messageId": "...",
+      "topic": "VendaProduto.EtapaAlterada",
+      "event": {
+        "numeroPedido": "34552",
+        "etapa": "20",
+        "etapaDescr": "Separação",
+        "idPedido": 9190977970,
+        "codIntPedido": "27772",
+        ...
+      },
+      "author": {...},
+      "appKey": "...",
+      ...
     }
+    """
+    payload = await request.json()
+    print("===== WEBHOOK RECEBIDO =====")
+    print(payload)
+    print("=============================")
 
-    print("\n===== JSON ENVIADO (AlterarRemessa) =====")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    print("=========================================")
+    topico = payload.get("topic")
+    if topico != "VendaProduto.EtapaAlterada":
+        print(f"↪️ Tópico '{topico}' não é de interesse. Ignorando.")
+        return {"status": "ignorado", "motivo": "topico não monitorado"}
 
-    return _chamada_omie(URL_REMESSA, payload)
+    evento = payload.get("event", {})
+    numero_pedido = evento.get("numeroPedido")
+    etapa = evento.get("etapa")
+    app_key_origem = payload.get("appKey", "")
 
+    if not numero_pedido:
+        print("❌ Não foi possível identificar o numeroPedido no payload.")
+        return {"status": "ignorado", "motivo": "numeroPedido não encontrado"}
 
-# ── PRODUTO (compartilhado) ────────────────────────────────────────────────────
+    if etapa != ETAPA_SEPARACAO:
+        print(f"↪️ Pedido {numero_pedido} mudou pra etapa {etapa} ({evento.get('etapaDescr')}), não é separação ({ETAPA_SEPARACAO}). Ignorando.")
+        return {"status": "ignorado", "motivo": f"etapa {etapa} não monitorada"}
 
-def consultar_produto(codigo_produto, app_key_origem: str) -> Tuple[Optional[str], Optional[str]]:
-    """Retorna (descricao, sku). Cacheado em memória durante o processo."""
-    cache_key = f"{app_key_origem}:{codigo_produto}"
-    if cache_key in _cache_produto:
-        return _cache_produto[cache_key]
-
-    app_key, app_secret = _get_credenciais(app_key_origem)
-    payload = {
-        "call": "ConsultarProduto",
-        "app_key": app_key,
-        "app_secret": app_secret,
-        "param": [{"codigo_produto": codigo_produto}],
-    }
-    retorno = _chamada_omie(URL_PRODUTO, payload)
-
-    if "faultstring" in retorno:
-        print(f"❌ Erro ao consultar produto {codigo_produto}: {retorno.get('faultstring')}")
-        return None, None
-
-    resultado = (retorno.get("descricao"), retorno.get("codigo"))
-    _cache_produto[cache_key] = resultado
-    return resultado
+    try:
+        processar_pedido(numero_pedido, app_key_origem)
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"❌ Erro ao processar pedido {numero_pedido}: {e}")
+        return {"status": "erro", "mensagem": str(e)}
