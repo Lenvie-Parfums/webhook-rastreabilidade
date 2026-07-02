@@ -228,7 +228,7 @@ async def webhook_remessa_criada(request: Request):
     print("=====================================")
 
     topico = payload.get("topic")
-    if topico != "RemessaProduto.Incluida":
+    if topico.lower() != "remessaproduto.incluida":
         print(f"↪️ Tópico '{topico}' não é RemessaProduto.Incluida. Ignorando.")
         return {"status": "ignorado", "motivo": "topico não monitorado"}
 
@@ -283,7 +283,7 @@ async def webhook_etapa_pedido(request: Request):
     print("=============================")
 
     topico = payload.get("topic")
-    if topico != "VendaProduto.EtapaAlterada":
+    if topico.lower() != "vendaproduto.etapaalterada":
         print(f"↪️ Tópico '{topico}' não é de interesse. Ignorando.")
         return {"status": "ignorado", "motivo": "topico não monitorado"}
 
