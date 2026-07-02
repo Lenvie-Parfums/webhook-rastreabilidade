@@ -9,7 +9,7 @@ e preenche especie_volumes/marca_volumes no frete.
 Deploy: Render (mesmo padrão do projeto FRI Matriz -> ATIVA).
 """
 
-import os
+import json
 from datetime import date, datetime
 
 from fastapi import FastAPI, Request
@@ -129,10 +129,6 @@ def processar_remessa(cod_remessa: int, app_key_origem: str):
 
     dados = consultar_remessa(cod_remessa, app_key_origem)
 
-    print(f"===== DADOS DA REMESSA {cod_remessa} =====")
-    print(json.dumps(dados, indent=2, ensure_ascii=False, default=str))
-    print("==========================================")
-
     cabec = dados.get("cabec", {})
     cod_cliente = cabec.get("nCodCli")
     numero_remessa = cabec.get("cNumeroRemessa", cod_remessa)
@@ -246,6 +242,9 @@ async def webhook_remessa_criada(request: Request):
     except Exception as e:
         print(f"❌ Erro ao processar remessa {cod_remessa}: {e}")
         return {"status": "erro", "mensagem": str(e)}
+
+
+@app.get("/webhook/etapa-pedido")
 def webhook_etapa_pedido_check():
     """Responde ao teste de validação que o Omie faz ao salvar o webhook."""
     return {"status": "ok"}
