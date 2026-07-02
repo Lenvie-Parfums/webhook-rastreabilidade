@@ -129,6 +129,12 @@ def processar_remessa(cod_remessa: int, app_key_origem: str):
 
     dados = consultar_remessa(cod_remessa, app_key_origem)
 
+    # DEBUG TEMPORÁRIO — remover após confirmar estrutura do retorno
+    import json as _json
+    print(f"===== DADOS DA REMESSA {cod_remessa} =====")
+    print(_json.dumps(dados, indent=2, ensure_ascii=False, default=str))
+    print("==========================================")
+
     cabec = dados.get("cabec", {})
     cod_cliente = cabec.get("nCodCli")
     numero_remessa = cabec.get("cNumeroRemessa", cod_remessa)
