@@ -22,9 +22,10 @@ FLUXO REMESSA
 Deploy: Render — mesmo padrão do projeto FRI Matriz -> ATIVA.
 """
 
+from collections import deque
 from datetime import date, datetime
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 
 from utils.api_omie import (
     consultar_pedido,
@@ -43,6 +44,26 @@ ETAPAS_MONITORADAS = {"10", "20", "50"}
 # Remessa NÃO tem cache: pode receber itens novos/corrigidos a qualquer momento,
 # então toda alteração é reprocessada (com guard anti-loop por comparação).
 _pedidos_resolvidos: set = set()
+
+# dedup por messageId: o Omie reentrega o mesmo evento até receber 200 rápido.
+# Guardamos os últimos IDs vistos pra descartar reentregas antes de processar.
+_mensagens_vistas: set = set()
+_mensagens_ordem: deque = deque(maxlen=2000)
+
+
+def _ja_processada(message_id: str) -> bool:
+    """True se esse messageId já foi recebido antes (reentrega do Omie)."""
+    if not message_id:
+        return False
+    if message_id in _mensagens_vistas:
+        return True
+    _mensagens_vistas.add(message_id)
+    # mantém o set limitado: quando a deque estoura, remove o ID mais antigo do set
+    if len(_mensagens_ordem) == _mensagens_ordem.maxlen:
+        antigo = _mensagens_ordem[0]
+        _mensagens_vistas.discard(antigo)
+    _mensagens_ordem.append(message_id)
+    return False
 
 
 # ── UTILITÁRIOS ────────────────────────────────────────────────────────────────
@@ -158,8 +179,14 @@ def webhook_etapa_pedido_check():
 
 
 @app.post("/webhook/etapa-pedido")
-async def webhook_etapa_pedido(request: Request):
+async def webhook_etapa_pedido(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
+
+    message_id = payload.get("messageId", "")
+    if _ja_processada(message_id):
+        # reentrega do mesmo evento — descarta sem processar
+        return {"status": "duplicado"}
+
     print("===== WEBHOOK PEDIDO RECEBIDO =====")
     print(payload)
     print("===================================")
@@ -181,12 +208,17 @@ async def webhook_etapa_pedido(request: Request):
         print(f"↪️ Pedido {numero_pedido} foi pra etapa {etapa}. Ignorando.")
         return {"status": "ignorado", "motivo": f"etapa {etapa} não monitorada"}
 
+    # responde 200 imediatamente; o processamento pesado roda em background
+    background_tasks.add_task(_processar_pedido_seguro, numero_pedido, app_key_origem)
+    return {"status": "aceito"}
+
+
+def _processar_pedido_seguro(numero_pedido: str, app_key_origem: str):
+    """Wrapper que captura exceções pra não derrubar a background task."""
     try:
         _processar_pedido(numero_pedido, app_key_origem)
-        return {"status": "ok"}
     except Exception as e:
         print(f"❌ Erro ao processar pedido {numero_pedido}: {e}")
-        return {"status": "erro", "mensagem": str(e)}
 
 
 # ── REMESSA ────────────────────────────────────────────────────────────────────
@@ -269,8 +301,13 @@ def webhook_remessa_check():
 
 
 @app.post("/webhook/remessa-criada")
-async def webhook_remessa_criada(request: Request):
+async def webhook_remessa_criada(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
+
+    message_id = payload.get("messageId", "")
+    if _ja_processada(message_id):
+        return {"status": "duplicado"}
+
     print("===== WEBHOOK REMESSA RECEBIDO =====")
     print(payload)
     print("=====================================")
@@ -287,9 +324,13 @@ async def webhook_remessa_criada(request: Request):
         print("❌ Código da remessa não encontrado no payload.")
         return {"status": "ignorado", "motivo": "idRemessa não encontrado"}
 
+    background_tasks.add_task(_processar_remessa_seguro, int(cod_remessa), app_key_origem)
+    return {"status": "aceito"}
+
+
+def _processar_remessa_seguro(cod_remessa: int, app_key_origem: str):
+    """Wrapper que captura exceções pra não derrubar a background task."""
     try:
-        _processar_remessa(int(cod_remessa), app_key_origem)
-        return {"status": "ok"}
+        _processar_remessa(cod_remessa, app_key_origem)
     except Exception as e:
         print(f"❌ Erro ao processar remessa {cod_remessa}: {e}")
-        return {"status": "erro", "mensagem": str(e)}
