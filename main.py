@@ -22,10 +22,12 @@ FLUXO REMESSA
 Deploy: Render — mesmo padrão do projeto FRI Matriz -> ATIVA.
 """
 
+import os
 from collections import deque
 from datetime import date, datetime
 
 from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 
 from utils.api_omie import (
     consultar_pedido,
@@ -33,10 +35,16 @@ from utils.api_omie import (
     alterar_pedido_rastreabilidade,
     consultar_remessa,
     alterar_remessa_rastreabilidade,
+    listar_pedidos_nao_faturados,
+    listar_remessas_nao_faturadas,
+    APPKEYS_EMPRESAS,
 )
 from utils.neon_select import buscar_lote_validade
 
 app = FastAPI()
+
+# token pra proteger o endpoint de varredura (configurar no Render)
+VARREDURA_TOKEN = os.environ.get("VARREDURA_TOKEN", "")
 
 ETAPAS_MONITORADAS = {"10", "20", "50"}
 
@@ -122,8 +130,9 @@ def health():
 
 # ── PEDIDO DE VENDA ────────────────────────────────────────────────────────────
 
-def _processar_pedido(numero_pedido: str, app_key_origem: str):
-    if numero_pedido in _pedidos_resolvidos:
+def _processar_pedido(numero_pedido: str, app_key_origem: str, forcar: bool = False):
+    # a varredura usa forcar=True pra reprocessar mesmo o que já está no cache
+    if not forcar and numero_pedido in _pedidos_resolvidos:
         print(f"↪️ Pedido {numero_pedido} já resolvido. Ignorando.")
         return
 
@@ -334,3 +343,63 @@ def _processar_remessa_seguro(cod_remessa: int, app_key_origem: str):
         _processar_remessa(cod_remessa, app_key_origem)
     except Exception as e:
         print(f"❌ Erro ao processar remessa {cod_remessa}: {e}")
+
+
+# ── VARREDURA DE SEGURANÇA ─────────────────────────────────────────────────────
+# Rede de segurança: lista tudo que está não faturado (pedidos e remessas, nas
+# duas empresas) e garante lote/validade, independente de etapa ou de webhook.
+# Disparada por cron externo (cron-job.org) a cada 5 min.
+
+def _rodar_varredura():
+    print("========== INÍCIO DA VARREDURA ==========")
+    total_pedidos = 0
+    total_remessas = 0
+
+    for app_key in APPKEYS_EMPRESAS:
+        # ── pedidos não faturados ──
+        try:
+            pedidos = listar_pedidos_nao_faturados(app_key)
+            print(f"🔎 Empresa {app_key[:6]}...: {len(pedidos)} pedido(s) não faturado(s).")
+            for ped in pedidos:
+                numero = ped.get("numero_pedido")
+                if not numero:
+                    continue
+                try:
+                    # forcar=True: varredura sempre reavalia, não confia no cache
+                    _processar_pedido(str(numero), app_key, forcar=True)
+                    total_pedidos += 1
+                except Exception as e:
+                    print(f"❌ Varredura pedido {numero}: {e}")
+        except Exception as e:
+            print(f"❌ Erro ao listar pedidos da empresa {app_key[:6]}...: {e}")
+
+        # ── remessas não faturadas ──
+        try:
+            remessas = listar_remessas_nao_faturadas(app_key)
+            print(f"🔎 Empresa {app_key[:6]}...: {len(remessas)} remessa(s) não faturada(s).")
+            for rem in remessas:
+                cod = rem.get("nCodRem")
+                if not cod:
+                    continue
+                try:
+                    _processar_remessa(int(cod), app_key)
+                    total_remessas += 1
+                except Exception as e:
+                    print(f"❌ Varredura remessa {cod}: {e}")
+        except Exception as e:
+            print(f"❌ Erro ao listar remessas da empresa {app_key[:6]}...: {e}")
+
+    print(f"========== FIM DA VARREDURA ({total_pedidos} pedidos, {total_remessas} remessas) ==========")
+
+
+@app.get("/varredura")
+@app.post("/varredura")
+async def varredura(request: Request, background_tasks: BackgroundTasks):
+    # proteção por token: só dispara com o token certo
+    token = request.query_params.get("token", "")
+    if VARREDURA_TOKEN and token != VARREDURA_TOKEN:
+        return JSONResponse(status_code=403, content={"status": "token inválido"})
+
+    # roda em background pra responder rápido ao cron
+    background_tasks.add_task(_rodar_varredura)
+    return {"status": "varredura iniciada"}
