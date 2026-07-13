@@ -18,6 +18,9 @@ URL_PRODUTO = "https://app.omie.com.br/api/v1/geral/produtos/"
 # cache simples em memória pra não bater 2x no mesmo produto durante um pedido
 _cache_produto = {}
 
+# lista das empresas a varrer (chave usada pelo _get_credenciais)
+APPKEYS_EMPRESAS = [APP_KEY_MATRIZ, APP_KEY_003]
+
 
 def _get_credenciais(app_key_origem: str):
     """Retorna (app_key, app_secret) corretos com base no appKey que veio no payload."""
@@ -49,6 +52,99 @@ def _chamada_omie(url, payload, tentativas=4):
 
     print("❌ Todas as tentativas usadas, retornando último resultado")
     return resultado
+
+
+# ── LISTAGENS (para a varredura de segurança) ──────────────────────────────────
+
+def listar_pedidos_nao_faturados(app_key_alvo: str) -> list:
+    """
+    Lista TODOS os pedidos não faturados de uma empresa, paginando até o fim.
+    Retorna lista de dicts com pelo menos numero_pedido e etapa.
+    Filtro: apenas_importado_api = "N" (todos), faturada tratada no retorno.
+    """
+    app_key, app_secret = _get_credenciais(app_key_alvo)
+    pedidos = []
+    pagina = 1
+
+    while True:
+        payload = {
+            "call": "ListarPedidos",
+            "app_key": app_key,
+            "app_secret": app_secret,
+            "param": [{
+                "pagina": pagina,
+                "registros_por_pagina": 100,
+                "apenas_importado_api": "N",
+            }],
+        }
+        retorno = _chamada_omie(URL_PEDIDO, payload)
+
+        if "faultstring" in retorno:
+            print(f"❌ ListarPedidos (pág {pagina}): {retorno.get('faultstring')}")
+            break
+
+        lote = retorno.get("pedido_venda_produto", [])
+        for ped in lote:
+            cab = ped.get("cabecalho", {})
+            info = ped.get("infoCadastro", {})
+            # considera não faturado se a flag de faturado não for "S"
+            faturada = str(info.get("faturado", "")).upper()
+            if faturada == "S":
+                continue
+            pedidos.append({
+                "numero_pedido": cab.get("numero_pedido"),
+                "etapa": cab.get("etapa"),
+            })
+
+        total_paginas = retorno.get("total_de_paginas", 1)
+        if pagina >= total_paginas:
+            break
+        pagina += 1
+
+    return pedidos
+
+
+def listar_remessas_nao_faturadas(app_key_alvo: str) -> list:
+    """
+    Lista TODAS as remessas não faturadas de uma empresa, paginando até o fim.
+    Retorna lista de dicts com nCodRem.
+    """
+    app_key, app_secret = _get_credenciais(app_key_alvo)
+    remessas = []
+    pagina = 1
+
+    while True:
+        payload = {
+            "call": "ListarRemessas",
+            "app_key": app_key,
+            "app_secret": app_secret,
+            "param": [{
+                "nPagina": pagina,
+                "nRegPorPagina": 100,
+            }],
+        }
+        retorno = _chamada_omie(URL_REMESSA, payload)
+
+        if "faultstring" in retorno:
+            print(f"❌ ListarRemessas (pág {pagina}): {retorno.get('faultstring')}")
+            break
+
+        lote = retorno.get("remessaCadastro", retorno.get("cadastros", []))
+        for rem in lote:
+            cabec = rem.get("cabec", rem)
+            faturada = str(cabec.get("cFaturada", cabec.get("faturada", ""))).upper()
+            if faturada == "S":
+                continue
+            cod = cabec.get("nCodRem") or rem.get("nCodRem")
+            if cod:
+                remessas.append({"nCodRem": cod})
+
+        total_paginas = retorno.get("nTotPaginas", retorno.get("total_de_paginas", 1))
+        if pagina >= total_paginas:
+            break
+        pagina += 1
+
+    return remessas
 
 
 # ── PEDIDO DE VENDA ────────────────────────────────────────────────────────────
