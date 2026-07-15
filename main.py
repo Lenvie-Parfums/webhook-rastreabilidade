@@ -38,6 +38,8 @@ from utils.api_omie import (
     listar_pedidos_nao_faturados,
     listar_remessas_nao_faturadas,
     APPKEYS_EMPRESAS,
+    adquirir_lock_varredura,
+    liberar_lock_varredura,
 )
 from utils.neon_select import buscar_lote_validade
 
@@ -351,6 +353,16 @@ def _processar_remessa_seguro(cod_remessa: int, app_key_origem: str):
 # Disparada por cron externo (cron-job.org) a cada 5 min.
 
 def _rodar_varredura():
+    # evita execuções simultâneas que colidem no rate limit do Omie
+    if not adquirir_lock_varredura():
+        return
+    try:
+        _rodar_varredura_interna()
+    finally:
+        liberar_lock_varredura()
+
+
+def _rodar_varredura_interna():
     print("========== INÍCIO DA VARREDURA ==========")
     total_pedidos = 0
     total_remessas = 0
@@ -403,3 +415,91 @@ async def varredura(request: Request, background_tasks: BackgroundTasks):
     # roda em background pra responder rápido ao cron
     background_tasks.add_task(_rodar_varredura)
     return {"status": "varredura iniciada"}
+
+
+# ── DIAGNÓSTICO (temporário) ───────────────────────────────────────────────────
+
+@app.get("/diagnostico/sku")
+async def diagnostico_sku(request: Request, sku: str):
+    """
+    Diagnóstico pontual de um SKU.
+    Uso: /diagnostico/sku?sku=10142200&token=SEU_TOKEN
+    Mostra o que o Omie retorna no ConsultarProduto e o que está no Neon.
+    """
+    token = request.query_params.get("token", "")
+    if VARREDURA_TOKEN and token != VARREDURA_TOKEN:
+        return JSONResponse(status_code=403, content={"status": "token inválido"})
+
+    resultado = {}
+
+    # busca no Neon
+    try:
+        lote, validade = buscar_lote_validade(sku)
+        fab, val = _calcular_fabricacao_validade(validade or "")
+        resultado["neon"] = {
+            "sku_buscado": sku,
+            "lote": lote,
+            "validade_raw": validade,
+            "fabricacao_calculada": fab,
+            "validade_calculada": val,
+        }
+    except Exception as e:
+        resultado["neon"] = {"erro": str(e)}
+
+    return resultado
+
+
+@app.get("/diagnostico/pedido")
+async def diagnostico_pedido(request: Request, numero: str, empresa: str = "matriz"):
+    """
+    Diagnóstico de um pedido completo.
+    Uso: /diagnostico/pedido?numero=34627&empresa=matriz&token=SEU_TOKEN
+         empresa: 'matriz' ou '003'
+    Mostra cada item do pedido, o SKU retornado pelo Omie e o lote encontrado no Neon.
+    """
+    token = request.query_params.get("token", "")
+    if VARREDURA_TOKEN and token != VARREDURA_TOKEN:
+        return JSONResponse(status_code=403, content={"status": "token inválido"})
+
+    from utils.api_omie import APP_KEY_003, APP_KEY_MATRIZ
+    app_key = APP_KEY_003 if empresa == "003" else APP_KEY_MATRIZ
+
+    dados = consultar_pedido(numero, app_key)
+    if _tem_erro(dados):
+        return {"erro": dados.get("faultstring")}
+
+    itens = dados.get("pedido_venda_produto", {}).get("det", [])
+    resultado = []
+
+    for idx, item in enumerate(itens, start=1):
+        produto = item.get("produto", {})
+        codigo_produto = produto.get("codigo_produto")
+        qtd = produto.get("quantidade")
+
+        desc, sku = consultar_produto(codigo_produto, app_key)
+
+        lote, validade = (None, None)
+        if sku:
+            lote, validade = buscar_lote_validade(sku)
+
+        fab, val = _calcular_fabricacao_validade(validade or "")
+
+        resultado.append({
+            "item": idx,
+            "codigo_produto_omie": codigo_produto,
+            "descricao_omie": desc,
+            "sku_retornado_omie": sku,
+            "quantidade": qtd,
+            "neon_lote": lote,
+            "neon_validade_raw": validade,
+            "fabricacao_calculada": fab,
+            "validade_calculada": val,
+            "vai_gravar": bool(lote),
+        })
+
+    return {
+        "numero_pedido": numero,
+        "empresa": empresa,
+        "total_itens": len(itens),
+        "itens": resultado,
+    }
