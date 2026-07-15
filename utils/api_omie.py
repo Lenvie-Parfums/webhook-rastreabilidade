@@ -221,10 +221,6 @@ def alterar_pedido_rastreabilidade(codigo_pedido, det_atualizado, app_key_origem
             },
         }],
     }
-    print("\n===== JSON ENVIADO (AlterarPedidoVenda) =====")
-    import json as _j
-    print(_j.dumps(payload, indent=2, ensure_ascii=False))
-    print("==============================================")
     return _chamada_omie(URL_PEDIDO, payload)
 
 
