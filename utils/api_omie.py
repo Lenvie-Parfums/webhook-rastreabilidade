@@ -84,6 +84,11 @@ def listar_pedidos_nao_faturados(app_key_alvo: str) -> list:
     pedidos = []
     pagina = 1
 
+    # filtra só os últimos 2 dias — evita varrer o histórico inteiro (665 páginas)
+    from datetime import datetime, timedelta
+    hoje = datetime.now()
+    data_de = (hoje - timedelta(days=2)).strftime("%d/%m/%Y")
+
     while True:
         payload = {
             "call": "ListarPedidos",
@@ -91,8 +96,9 @@ def listar_pedidos_nao_faturados(app_key_alvo: str) -> list:
             "app_secret": app_secret,
             "param": [{
                 "pagina": pagina,
-                "registros_por_pagina": 50,  # menor pra reduzir risco de colisão
+                "registros_por_pagina": 50,
                 "apenas_importado_api": "N",
+                "filtrar_por_data_de": data_de,
             }],
         }
         retorno = _chamada_omie(URL_PEDIDO, payload)
@@ -135,8 +141,11 @@ def listar_remessas_nao_faturadas(app_key_alvo: str) -> list:
     remessas = []
     pagina = 1
 
+    from datetime import datetime, timedelta
+    hoje = datetime.now()
+    data_de = (hoje - timedelta(days=2)).strftime("%d/%m/%Y")
+
     while True:
-        # RemessaProduto usa pagina/registros_por_pagina (igual ListarPedidos)
         payload = {
             "call": "ListarRemessas",
             "app_key": app_key,
@@ -144,6 +153,7 @@ def listar_remessas_nao_faturadas(app_key_alvo: str) -> list:
             "param": [{
                 "pagina": pagina,
                 "registros_por_pagina": 50,
+                "filtrar_por_data_de": data_de,
             }],
         }
         retorno = _chamada_omie(URL_REMESSA, payload)
