@@ -159,6 +159,8 @@ def _processar_pedido(numero_pedido: str, app_key_origem: str, forcar: bool = Fa
         if sku:
             lote, validade_raw = buscar_lote_validade(sku)
 
+        print(f"   🔍 cod={codigo_produto} | sku='{sku}' | lote='{lote}'")
+
         if not lote:
             # SKU sem lote no Neon: descarta o item (não bloqueia, não retenta)
             continue
