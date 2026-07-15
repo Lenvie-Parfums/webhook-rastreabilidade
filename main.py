@@ -153,10 +153,7 @@ def _processar_pedido(numero_pedido: str, app_key_origem: str, forcar: bool = Fa
         codigo_produto = produto.get("codigo_produto")
         ide = item.get("ide", {})
         codigo_item_integracao = ide.get("codigo_item_integracao") or ""
-        codigo_item = ide.get("codigo_item") or ""
-        # quando codigo_item_integracao está vazio (item criado manualmente no Omie),
-        # usa codigo_item como identificador — nunca usa índice sequencial
-        identificador_item = codigo_item_integracao or codigo_item
+        codigo_item = str(ide.get("codigo_item") or "")
 
         _desc, sku = consultar_produto(codigo_produto, app_key_origem)
 
@@ -169,8 +166,16 @@ def _processar_pedido(numero_pedido: str, app_key_origem: str, forcar: bool = Fa
             # SKU sem lote no Neon: descarta o item (não bloqueia, não retenta)
             continue
 
+        # monta o ide com o campo correto:
+        # - codigo_item_integracao: quando o item veio via API (Mercos, integração)
+        # - codigo_item: quando o item foi criado manualmente no Omie (campo vazio)
+        if codigo_item_integracao:
+            ide_payload = {"codigo_item_integracao": codigo_item_integracao}
+        else:
+            ide_payload = {"codigo_item": codigo_item}
+
         det_atualizado.append({
-            "ide": {"codigo_item_integracao": identificador_item},
+            "ide": ide_payload,
             "rastreabilidade": _montar_rastreabilidade(lote, produto.get("quantidade"), validade_raw),
         })
 
