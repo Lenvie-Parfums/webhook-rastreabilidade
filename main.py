@@ -151,7 +151,12 @@ def _processar_pedido(numero_pedido: str, app_key_origem: str, forcar: bool = Fa
     for idx, item in enumerate(itens, start=1):
         produto = item.get("produto", {})
         codigo_produto = produto.get("codigo_produto")
-        codigo_item_integracao = item.get("ide", {}).get("codigo_item_integracao") or str(idx)
+        ide = item.get("ide", {})
+        codigo_item_integracao = ide.get("codigo_item_integracao") or ""
+        codigo_item = ide.get("codigo_item") or ""
+        # quando codigo_item_integracao está vazio (item criado manualmente no Omie),
+        # usa codigo_item como identificador — nunca usa índice sequencial
+        identificador_item = codigo_item_integracao or codigo_item
 
         _desc, sku = consultar_produto(codigo_produto, app_key_origem)
 
@@ -165,7 +170,7 @@ def _processar_pedido(numero_pedido: str, app_key_origem: str, forcar: bool = Fa
             continue
 
         det_atualizado.append({
-            "ide": {"codigo_item_integracao": codigo_item_integracao},
+            "ide": {"codigo_item_integracao": identificador_item},
             "rastreabilidade": _montar_rastreabilidade(lote, produto.get("quantidade"), validade_raw),
         })
 
